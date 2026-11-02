@@ -1,0 +1,1630 @@
+#!/usr/bin/env bash
+# ccs — Claude Code Sessions
+#
+# A Claude-Desktop-like manager for every Claude Code session (all projects), from outside claude.
+#
+# Keys (navigation mode):
+#   Enter      resume the selected session (claude --resume, run from its project directory;
+#              a conversation running in the background is attached with `claude attach`, no copy)
+#   f          resume as a fork (new session id, the original stays untouched)
+#   r          rename (stored like /rename does, so claude's own --resume picker shows it too)
+#   p          pin / unpin (pinned sessions stay on top, alphabetically)
+#   x          move to the trash (restorable with `ccs restore <id>`)
+#   e          export the conversation to Markdown (~/Downloads)
+#   y          copy `cd <cwd> && claude --resume <id>` to the clipboard
+#   o          open the project directory in Finder
+#   h / t      (inside herdr) resume in a new pane split to the right / in a new tab
+#   Space      select several sessions (pin / trash act on all of them)
+#   /          search (Esc goes back to navigation, the filter stays)
+#   s          cycle sort: date → name → project
+#   ctrl-p     cycle filter: all → pinned → open now → this directory
+#   ctrl-a     show / hide empty sessions
+#   ctrl-v     show / hide forks and daemon copies of the same conversation (folded by default, ⑂N)
+#   ctrl-f     full-text filter: keep only sessions whose prompts contain the words
+#   ctrl-x     prune: trash old sessions with (almost) no prompts, after confirmation
+#   j / k      down / up, g / G first / last, Tab show/hide the preview, ? help
+#   ctrl-r     rebuild the index, q quit
+#
+# Usage:
+#   ccs                       open the list
+#   ccs <text>                open the list already filtered
+#   ccs -a                    start with empty sessions visible
+#   ccs -g <words>            start with the full-text filter set (ccs grep <words> prints the matches)
+#   ccs -- <arg…>             extra arguments for claude on resume (e.g. ccs -- --model fable)
+#   ccs resume|fork <id> [-- arg…]   resume directly (a unique prefix of the id is enough)
+#   ccs rename <id> [new name]
+#   ccs pin <id> | export <id> [file] | delete <id>… | trash | restore <id>
+#   ccs herdr <id> [--tab]    resume in a new herdr pane (or tab)
+#   ccs prune [--days N] [--max N] [--yes]   trash sessions older than N days with ≤ N prompts
+#   ccs dedupe [--forks N] [--yes]   trash copies of a conversation that hold no message of their own
+#   ccs list | grep <words> | preview <id> | stats | reindex | help
+#
+# Environment:
+#   CCS_CLAUDE_ARGS   arguments always appended to claude on resume (space-separated, no quoting)
+#   CCS_CLAUDE_DIR    Claude Code directory (default ~/.claude)
+#   CCS_CLAUDE_BIN    claude binary (default: the one in PATH)
+#
+# Own data: ~/.config/ccs/pins, ~/.config/ccs/state.json (sort, filters),
+#           ~/.cache/ccs/index.json (index cache), ~/.local/share/ccs/trash/ (deleted sessions).
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+export CCS_SELF="$SELF"       # the fzf command strings reference this variable, never the path itself
+export CCS_CLAUDE_DIR="${CCS_CLAUDE_DIR:-$HOME/.claude}"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ccs"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ccs"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ccs"
+export CCS_PINS="${CCS_PINS:-$CONF_DIR/pins}"
+export CCS_STATE="${CCS_STATE:-$CONF_DIR/state.json}"
+export CCS_CACHE="${CCS_CACHE:-$CACHE_DIR/index.json}"
+if [[ -z ${CCS_TRASH:-} ]]; then
+  export CCS_TRASH="$DATA_DIR/trash"
+  export CCS_OLD_TRASH="$CACHE_DIR/trash"      # pre-2026-11 location, migrated by the python side
+fi
+CCS_OWN_DIRS="$CONF_DIR"$'\n'"$CACHE_DIR"$'\n'"$DATA_DIR"; export CCS_OWN_DIRS   # the only directories ccs chmods to 0700
+export CCS_PWD="${CCS_PWD:-$PWD}"
+
+# The Python part is read with `read -d ''` rather than $(cat <<'PY'): bash 3.2 choked on
+# an earlier version of this heredoc inside $(...), and `read` has no such parsing step.
+read -r -d '' PYCODE <<'PY' || true
+import os, sys, json, re, mmap, shutil, subprocess, time, zlib, datetime as dt
+
+os.umask(0o077)          # everything ccs creates (index, state, trash, exports) is private to the user
+CLAUDE_DIR = os.environ['CCS_CLAUDE_DIR']
+PINS = os.environ['CCS_PINS']
+STATE = os.environ['CCS_STATE']
+CACHE = os.environ['CCS_CACHE']
+TRASH = os.environ['CCS_TRASH']
+CUR_PWD = os.path.realpath(os.environ.get('CCS_PWD') or os.getcwd())
+PROJECTS = os.path.join(CLAUDE_DIR, 'projects')
+SESSIONS = os.path.join(CLAUDE_DIR, 'sessions')
+NAME_RE = re.compile(r'^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$')
+SKIP = ('<command-name>', '<command-message>', '<local-command-stdout>', '<local-command-caveat>',
+        '<system-reminder>', '<bash-input>', '<bash-stdout>', '<bash-stderr>', '<task-notification>',
+        '[Request interrupted', 'Caveat: The messages below')
+DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+SORTS = ['date', 'name', 'project']
+FILTERS = ['all', 'pinned', 'live', 'here']
+FILTER_LABEL = {'all': 'all', 'pinned': 'pinned only', 'live': 'open now', 'here': 'this directory'}
+INDEX_VERSION = 5          # bump when scan_file() learns new fields: old cache entries get rescanned
+PROMPT_CAP = 1000          # prompts kept per session for the full-text filter (bounded on purpose)
+PROMPT_CHARS = 500         # characters kept per prompt
+MODEL_RE = re.compile(rb'"model":"([^"<]{1,80})"')
+PALETTE = ['34', '35', '36', '33', '32', '94', '95', '96', '93', '92']   # stable per-project colors
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m"
+
+
+# ---------- small persistent files ----------
+
+def ensure_private():
+    """ccs's own directories are 0700 and its own files 0600; directories chosen by the user
+    through CCS_* overrides are left alone (they may be shared)."""
+    own = [d for d in os.environ.get('CCS_OWN_DIRS', '').split('\n') if d]
+    for d in own:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.stat(d).st_mode & 0o077:
+                os.chmod(d, 0o700)
+        except OSError as e:
+            print(f"ccs: could not make {d} private: {e}", file=sys.stderr)
+    for f in (PINS, STATE, CACHE):
+        try:
+            if os.path.isfile(f) and os.stat(f).st_mode & 0o077:
+                os.chmod(f, 0o600)
+        except OSError as e:
+            print(f"ccs: could not make {f} private: {e}", file=sys.stderr)
+
+
+def migrate_trash():
+    """The trash used to live under the cache directory: move it where cache cleaners do not look,
+    privately, merging into an existing new trash without ever overwriting."""
+    old = os.environ.get('CCS_OLD_TRASH')
+    if not old or not os.path.isdir(old) or os.path.realpath(old) == os.path.realpath(TRASH):
+        return
+    try:
+        os.makedirs(TRASH, exist_ok=True)
+        os.chmod(TRASH, 0o700)
+        for proj in os.listdir(old):
+            src_dir = os.path.join(old, proj)
+            if not os.path.isdir(src_dir):
+                continue
+            dst_dir = os.path.join(TRASH, proj)
+            os.makedirs(dst_dir, exist_ok=True)
+            names = os.listdir(src_dir)
+            units = {}                    # id -> [transcript?, sidecar dir?]: the two move together or not at all
+            for name in names:
+                m = NAME_RE.match(name)
+                key = m.group(1) if m else (name if os.path.isdir(os.path.join(src_dir, name)) else None)
+                if key is None:
+                    continue              # set-aside backups (*.jsonl.<date>) stay where they are
+                units.setdefault(key, []).append(name)
+            for key, parts in units.items():
+                if any(os.path.lexists(os.path.join(dst_dir, n)) for n in (f"{key}.jsonl", key)):
+                    continue              # same id deleted twice: keep both, this one stays in the old place
+                for n in parts:
+                    shutil.move(os.path.join(src_dir, n), os.path.join(dst_dir, n))
+            if not os.listdir(src_dir):
+                os.rmdir(src_dir)
+        if not os.listdir(old):
+            os.rmdir(old)
+        else:
+            print(f"ccs: note: some older trash entries were left in {old} (same ids exist in {TRASH})", file=sys.stderr)
+    except OSError as e:
+        print(f"ccs: trash migration from {old} failed: {e}", file=sys.stderr)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json_atomic(path, data):
+    # Unique temp name per process: list/header/preview may run concurrently.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def load_pins():
+    try:
+        with open(PINS, encoding='utf-8') as f:
+            return [l.strip() for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def save_pins(pins):
+    os.makedirs(os.path.dirname(PINS), exist_ok=True)
+    with open(PINS, 'w', encoding='utf-8') as f:
+        f.write(''.join(p + '\n' for p in pins))
+
+
+def load_state():
+    st = read_json(STATE, {})
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault('sort', 'date')
+    st.setdefault('filter', 'all')
+    st.setdefault('show_all', False)
+    st.setdefault('text', '')
+    st.setdefault('show_forks', False)
+    if not isinstance(st['text'], str):
+        st['text'] = ''
+    if st['sort'] not in SORTS:
+        st['sort'] = 'date'
+    if st['filter'] not in FILTERS:
+        st['filter'] = 'all'
+    return st
+
+
+def save_state(st):
+    write_json_atomic(STATE, st)
+
+
+# ---------- live sessions (registry written by claude itself) ----------
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def live_sessions():
+    """sessionId -> record from the ~/.claude/sessions/<pid>.json registry, live pids only.
+    (A reused pid can make a closed session look open until Claude rewrites its registry file.)"""
+    out = {}
+    try:
+        names = os.listdir(SESSIONS)
+    except FileNotFoundError:
+        return out
+    for n in names:
+        if not n.endswith('.json'):
+            continue
+        d = read_json(os.path.join(SESSIONS, n), None)
+        if isinstance(d, dict) and d.get('sessionId') and isinstance(d.get('pid'), int) and pid_alive(d['pid']):
+            out[d['sessionId']] = d
+    return out
+
+
+# ---------- transcript parsing ----------
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join((b.get('text') or '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+    return ''
+
+
+CONTROL_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]')
+
+
+def squash(s, n):
+    s = ' '.join(CONTROL_RE.sub('', s).split())    # transcript text never drives the terminal
+    return s if len(s) <= n else s[:n - 1].rstrip() + '…'
+
+
+def is_prompt(d, txt):
+    if d.get('isMeta') or d.get('isCompactSummary') or d.get('isVisibleInTranscriptOnly') or d.get('isSidechain'):
+        return False
+    t = txt.lstrip()
+    return bool(t) and not t.startswith(SKIP)
+
+
+def parse(line):
+    try:
+        return json.loads(line.decode('utf-8', 'replace'))
+    except Exception:
+        return None
+
+
+def open_mm(path):
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return None, None
+    try:
+        if os.fstat(f.fileno()).st_size == 0:
+            f.close()
+            return None, None
+        return f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    except Exception:
+        f.close()
+        return None, None
+
+
+def head_lines(mm, limit_bytes):
+    pos, total, L = 0, 0, len(mm)
+    while pos < L and total < limit_bytes:
+        e = mm.find(b'\n', pos)
+        if e < 0:
+            e = L
+        line = mm[pos:e]
+        pos = e + 1
+        total += len(line) + 1
+        yield line
+
+
+def last_entries(mm, needle, limit):
+    """The last lines (scanning from the end) that contain needle, already parsed."""
+    pos, n = len(mm), 0
+    while n < limit:
+        i = mm.rfind(needle, 0, pos)
+        if i < 0:
+            return
+        s = mm.rfind(b'\n', 0, i) + 1
+        e = mm.find(b'\n', i)
+        d = parse(mm[s:(len(mm) if e < 0 else e)])
+        if d is not None:
+            yield d
+            n += 1
+        if s == 0:
+            return
+        pos = s
+
+
+def scan_file(path, sid):
+    info = dict(id=sid, path=path, cwd=None, branch=None, kind=None, version=None, model=None,
+                first_prompt=None, first_ts=None, last_prompt=None, n_prompts=0, prompts=[],
+                first_uuid=None, continued_in=[], title=None, title_src=None, unreadable=False)
+    f, mm = open_mm(path)
+    if mm is None:
+        info['unreadable'] = os.path.getsize(path) > 0 if os.path.exists(path) else True
+        return info
+    try:
+        # title: the last custom-title entry wins (that is what claude's picker reads), else the last ai-title
+        for d in last_entries(mm, b'"type":"custom-title"', 6):
+            t = d.get('customTitle') if d.get('type') == 'custom-title' else None
+            if isinstance(t, str) and t.strip():
+                info['title'], info['title_src'] = squash(t, 150), 'custom'
+                break
+        if not info['title']:
+            for d in last_entries(mm, b'"type":"ai-title"', 6):
+                t = d.get('aiTitle') if d.get('type') == 'ai-title' else None
+                if isinstance(t, str) and t.strip():
+                    info['title'], info['title_src'] = squash(t, 150), 'ai'
+                    break
+        # model: the last assistant message that names one (synthetic "<...>" models are skipped by the regex)
+        pos = len(mm)
+        for _ in range(8):
+            i = mm.rfind(b'"model":"', 0, pos)
+            if i < 0:
+                break
+            m = MODEL_RE.match(mm, i)
+            if m:
+                info['model'] = m.group(1).decode('ascii', 'replace')
+                break
+            pos = i
+        # one full pass: metadata from the first entry, every real user prompt (for the text filter)
+        pos, L, n_json, n_lines = 0, len(mm), 0, 0
+        while pos < L:
+            e = mm.find(b'\n', pos)
+            if e < 0:
+                e = L
+            line = mm[pos:e]
+            pos = e + 1
+            if line.strip():
+                n_lines += 1
+                if line.startswith(b'{') and line.rstrip().endswith(b'}') and b'"type":"' in line:
+                    n_json += 1
+            if info['cwd'] is None and b'"cwd":' in line:
+                d = parse(line)
+                if d:
+                    info['cwd'] = d.get('cwd') or None
+                    info['branch'] = d.get('gitBranch') or None
+                    info['kind'] = d.get('sessionKind') or None
+                    info['version'] = d.get('version') or None
+                    info['first_ts'] = d.get('timestamp') or None
+            if b'"type":"continued-in"' in line:
+                d = parse(line)
+                if d and d.get('type') == 'continued-in' and d.get('continuedInSessionId'):
+                    info['continued_in'].append(d['continuedInSessionId'])
+                continue
+            if b'"type":"user"' not in line or b'"tool_result"' in line or b'"isMeta":true' in line:
+                continue
+            d = parse(line)
+            if not d or d.get('type') != 'user':
+                continue
+            if info['first_uuid'] is None and d.get('uuid'):
+                info['first_uuid'] = d['uuid']     # forks copy the history, so this identifies the conversation
+            txt = text_of((d.get('message') or {}).get('content'))
+            if not is_prompt(d, txt):
+                continue
+            info['n_prompts'] += 1
+            if info['first_prompt'] is None:
+                info['first_prompt'] = squash(txt, 200)
+                info['first_ts'] = info['first_ts'] or d.get('timestamp')
+            info['last_prompt'] = squash(txt, 500)
+            if len(info['prompts']) < PROMPT_CAP:
+                info['prompts'].append(squash(txt, PROMPT_CHARS))
+        if n_lines and n_json != n_lines:
+            info['unreadable'] = True      # not (only) the compact JSONL Claude writes: never judge it empty
+    finally:
+        mm.close()
+        f.close()
+    return info
+
+
+def build_index():
+    cache = read_json(CACHE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    out, changed = {}, False
+    try:
+        projects = [p for p in os.scandir(PROJECTS) if p.is_dir()]
+    except FileNotFoundError:
+        projects = []
+    for proj in projects:
+        for f in os.scandir(proj.path):
+            m = NAME_RE.match(f.name)
+            if not m or not f.is_file():
+                continue
+            try:
+                st = f.stat()
+                cached = cache.get(f.path)
+                if (cached and cached.get('v') == INDEX_VERSION
+                        and cached.get('mtime') == st.st_mtime and cached.get('size') == st.st_size):
+                    out[f.path] = cached
+                    continue
+                info = scan_file(f.path, m.group(1))
+            except OSError:
+                changed = True            # removed meanwhile (another ccs, Claude's cleanup): skip it
+                continue
+            info.update(v=INDEX_VERSION, mtime=st.st_mtime, size=st.st_size, project_dir=proj.path)
+            out[f.path] = info
+            changed = True
+    if changed or set(out) != set(cache):
+        try:
+            write_json_atomic(CACHE, out)
+        except Exception:
+            pass  # cache is only an accelerator; never fail the listing for it
+    return list(out.values())
+
+
+def find(sid, sessions=None):
+    sessions = build_index() if sessions is None else sessions
+    exact = [s for s in sessions if s['id'] == sid]
+    if exact:
+        return exact[0]
+    pref = [s for s in sessions if s['id'].startswith(sid)]
+    return pref[0] if len(pref) == 1 else None
+
+
+# ---------- formatting ----------
+
+def fmt_date(ts):
+    d = dt.datetime.fromtimestamp(ts)
+    now = dt.datetime.now()
+    days = (now.date() - d.date()).days
+    if days == 0:
+        return f"today {d:%H:%M}"
+    if days == 1:
+        return f"yesterday {d:%H:%M}"
+    if 0 < days < 7:
+        return f"{DOW[d.weekday()]} {d:%H:%M}"
+    if d.year == now.year:
+        return f"{d:%d %b %H:%M}"
+    return f"{d:%d %b %Y}"
+
+
+def fmt_full(ts):
+    return f"{dt.datetime.fromtimestamp(ts):%d %b %Y %H:%M}"
+
+
+def fmt_iso(s):
+    if not s:
+        return '-'
+    try:
+        d = dt.datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone()
+        return f"{d:%d %b %Y %H:%M}"
+    except Exception:
+        return s
+
+
+def human(n):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f"{n:.0f} {unit}" if unit == 'B' else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def fit(s, n):
+    return squash(s, n).ljust(n)
+
+
+def project_label(s):
+    cwd = s.get('cwd')
+    if cwd:
+        return os.path.basename(cwd.rstrip('/')) or cwd
+    name = os.path.basename(s.get('project_dir', '')).lstrip('-')
+    return name if len(name) <= 18 else '…' + name[-17:]
+
+
+def project_color(name):
+    return PALETTE[zlib.crc32(name.casefold().encode('utf-8')) % len(PALETTE)]
+
+
+def label(s):
+    return (s.get('title') or s.get('first_prompt') or '').casefold()
+
+
+def matches_text(s, words):
+    hay = [(s.get('title') or ''), (s.get('first_prompt') or ''), (s.get('cwd') or '')] + list(s.get('prompts') or [])
+    hay = [h.casefold() for h in hay]
+    return all(any(w in h for h in hay) for w in words)
+
+
+def text_hit(s, words):
+    """The first prompt containing one of the words, for the grep output."""
+    for pr in s.get('prompts') or []:
+        low = pr.casefold()
+        if any(w in low for w in words):
+            return pr
+    return ''
+
+
+def is_here(s):
+    cwd = s.get('cwd')
+    return bool(cwd) and os.path.realpath(cwd) == CUR_PWD
+
+
+# ---------- lineages: forks and daemon worker copies of one conversation ----------
+
+def lineages(sessions, live=()):
+    """id -> {'head': id shown in the list, 'members': [...], 'last': newest mtime, 'workers': {ids}}.
+    Two transcripts belong to the same conversation when they start with the same user entry
+    (a fork copies the history) or when one says it was 'continued-in' the other (daemon worker).
+    The head is the worker that is running right now, if any (the original transcript only
+    catches up when the worker retires), otherwise the newest non-worker transcript."""
+    parent = {}
+
+    def root(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    by_id = {s['id']: s for s in sessions}
+    by_first = {}
+    for s in sessions:
+        if s.get('first_uuid'):
+            by_first.setdefault(s['first_uuid'], []).append(s['id'])
+    for ids in by_first.values():
+        for i in ids[1:]:
+            union(ids[0], i)
+    workers = set()
+    for s in sessions:
+        for t in s.get('continued_in') or []:
+            if t in by_id:
+                union(s['id'], t)
+                workers.add(t)
+    groups = {}
+    for s in sessions:
+        groups.setdefault(root(s['id']), []).append(s)
+    out = {}
+    for members in groups.values():
+        running = [m for m in members if m['id'] in workers and m['id'] in live]
+        live_any = [m for m in members if m['id'] in live]
+        cands = running or live_any or [m for m in members if m['id'] not in workers] or members
+        head = max(cands, key=lambda m: m['mtime'])['id']
+        originals = [m for m in members if m['id'] not in workers]
+        rec = {'head': head, 'members': sorted(members, key=lambda m: -m['mtime']),
+               'last': max(m['mtime'] for m in members), 'workers': workers & {m['id'] for m in members},
+               'original': max(originals, key=lambda m: m['mtime'])['id'] if originals else head}
+        for m in members:
+            out[m['id']] = rec
+    return out
+
+
+def eff_mtime(s, lin):
+    rec = lin.get(s['id'])
+    return rec['last'] if rec and rec['head'] == s['id'] else s['mtime']
+
+
+# ---------- list / header / stats ----------
+
+def visible_rows(sessions, st, pins, live, lin=None):
+    lin = lineages(sessions, live) if lin is None else lin
+    rows = [s for s in sessions if st['show_all'] or s.get('first_prompt') or s.get('title')]
+    if not st.get('show_forks'):
+        rows = [s for s in rows if lin[s['id']]['head'] == s['id'] or s['id'] in pins]
+    flt = st['filter']
+    if flt == 'pinned':
+        rows = [s for s in rows if s['id'] in pins]
+    elif flt == 'live':
+        rows = [s for s in rows if s['id'] in live]
+    elif flt == 'here':
+        rows = [s for s in rows if is_here(s)]
+    words = st.get('text', '').casefold().split()
+    if words:
+        rows = [s for s in rows if matches_text(s, words)]
+    if st['sort'] == 'name':
+        key = lambda s: (0 if s['id'] in pins else 1, label(s))
+    elif st['sort'] == 'project':
+        key = lambda s: (0 if s['id'] in pins else 1, project_label(s).casefold(), -eff_mtime(s, lin))
+    else:  # date; pinned ones alphabetically on top
+        key = lambda s: (0, label(s), 0) if s['id'] in pins else (1, '', -eff_mtime(s, lin))
+    rows.sort(key=key)
+    return rows
+
+
+def cmd_list():
+    st = load_state()
+    sessions = build_index()
+    pins = set(load_pins())
+    live = live_sessions()
+    lin = lineages(sessions, live)
+    out = []
+    for s in visible_rows(sessions, st, pins, live, lin):
+        rec = lin[s['id']]
+        pin = c('33', '★') if s['id'] in pins else ' '
+        lv = c('32', '●') if s['id'] in live else ' '
+        here = c('35', '◆') if is_here(s) else ' '
+        date = fit(fmt_date(eff_mtime(s, lin)), 15)
+        pl = project_label(s)
+        proj = c(project_color(pl), fit(pl, 18))
+        if s.get('title'):
+            title = s['title'] if s.get('title_src') == 'custom' else c('36', s['title'])
+        elif s.get('first_prompt'):
+            title = c('2', s['first_prompt'])
+        else:
+            title = c('2', '(empty session)')
+        if rec['head'] != s['id']:
+            kind = 'worker copy' if s['id'] in rec['workers'] else ('original' if s['id'] == rec['original'] else 'fork')
+            title = c('2', '↳ ') + title + c('2', f'  ({kind})')
+        elif len(rec['members']) > 1:
+            title += c('2', f"  ⑂{len(rec['members'])}")
+        out.append(f"{s['id']}\t{s.get('cwd') or ''}\t{pin}{lv}{here} {date} {proj} │ {title}\n")
+    sys.stdout.write(''.join(out))
+
+
+def cmd_header():
+    st = load_state()
+    sessions = build_index()
+    pins = set(load_pins())
+    live = live_sessions()
+    lin = lineages(sessions, live)
+    shown = len(visible_rows(sessions, st, pins, live, lin))
+    folded = sum(1 for s in sessions if lin[s['id']]['head'] != s['id'])
+    parts = [f"{shown}/{len(sessions)} sessions", f"{len(pins)} pinned", f"{len(live)} open now",
+             f"sort: {st['sort']}", f"filter: {FILTER_LABEL[st['filter']]}"]
+    if st['show_all']:
+        parts.append('empty shown')
+    if folded:
+        parts.append(f"{folded} forks shown" if st.get('show_forks') else f"{folded} forks folded (^v)")
+    if st.get('text'):
+        parts.append(c('33', f'text: "{st["text"]}"') + c('2', ''))
+    herdr = (c('1', 'h') + ' pane  ' + c('1', 't') + ' tab  ') if os.environ.get('HERDR_ENV') else ''
+    keys = (c('1', '⏎') + ' resume  ' + c('1', 'f') + ' fork  ' + herdr + c('1', 'r') + ' rename  ' + c('1', 'p') + ' pin  '
+            + c('1', 'x') + ' trash  ' + c('1', 'e') + ' export  ' + c('1', 'y') + ' copy  ' + c('1', 'o') + ' finder  '
+            + c('1', '/') + ' search  ' + c('1', '^f') + ' text  ' + c('1', 's') + ' sort  ' + c('1', '^p') + ' filter  '
+            + c('1', '^v') + ' forks  ' + c('1', '?') + ' help  ' + c('1', 'q') + ' quit')
+    print(keys)
+    print(c('2', ' · '.join(parts)))
+
+
+def cmd_keys():
+    print(c('1', 'ccs — keys'))
+    print()
+    rows = [('Enter', 'resume the selected session (from its project directory)'),
+            ('f', 'resume as a fork: new session id, the original is untouched'),
+            ('r', 'rename (same storage as /rename, visible in claude --resume too)'),
+            ('p', 'pin / unpin (pinned stay on top, alphabetically)'),
+            ('x', 'move to the trash (ccs trash / ccs restore <id>)'),
+            ('e', 'export the conversation to Markdown in ~/Downloads'),
+            ('y', 'copy "cd <cwd> && claude --resume <id>" to the clipboard'),
+            ('o', 'open the project directory in Finder'),
+            ('h / t', 'inside herdr: resume in a new pane (split right) / in a new tab'),
+            ('Space', 'select several sessions; p and x act on all of them'),
+            ('/', 'search; Esc goes back to navigation keeping the filter'),
+            ('s', 'cycle sort: date → name → project'),
+            ('ctrl-p', 'cycle filter: all → pinned → open now → this directory'),
+            ('ctrl-a', 'show / hide empty sessions'),
+            ('ctrl-v', 'show / hide forks and daemon worker copies of a conversation (⑂N on the row kept)'),
+            ('ctrl-f', 'text filter: sessions whose prompts (first 1000, 500 chars each) or title contain all the words'),
+            ('ctrl-x', 'prune: trash sessions older than 30 days with at most 2 prompts (asks first)'),
+            ('j / k', 'down / up    g / G first / last'),
+            ('Tab', 'show / hide this preview pane'),
+            ('ctrl-r', 'rebuild the index from disk'),
+            ('q / Esc', 'quit')]
+    for k, v in rows:
+        print(f"  {c('1', k.ljust(8))} {v}")
+    print()
+    print(c('2', 'Markers:  ★ pinned   ● open now   ◆ started in this directory   ⑂N = N transcripts of this conversation'))
+    print(c('2', 'Colors:   white = renamed by you   cyan = automatic title   dim = first prompt'))
+    print(c('2', '          each project has its own stable color'))
+
+
+def cmd_stats():
+    sessions = build_index()
+    pins = set(load_pins())
+    live = live_sessions()
+    by_proj = {}
+    for s in sessions:
+        p = s.get('cwd') or os.path.basename(s.get('project_dir', ''))
+        a = by_proj.setdefault(p, [0, 0, 0.0])
+        a[0] += 1
+        a[1] += s['size']
+        a[2] = max(a[2], s['mtime'])
+    total = sum(s['size'] for s in sessions)
+    print(c('1', f"{len(sessions)} sessions · {human(total)} · {len(pins)} pinned · {len(live)} open now"))
+    print()
+    for p, (n, size, last) in sorted(by_proj.items(), key=lambda kv: -kv[1][0]):
+        print(f"{n:5d}  {human(size):>9}  {fmt_full(last)}  {p}")
+    try:
+        n_trash = len(trash_items())
+        print()
+        print(c('2', f"trash: {n_trash} session(s) in {TRASH}"))
+    except FileNotFoundError:
+        pass
+
+
+# ---------- preview ----------
+
+def cmd_preview(sid):
+    s = find(sid)
+    if not s:
+        print('session not found')
+        return
+    sid = s['id']
+    live = live_sessions().get(sid)
+    pins = set(load_pins())
+    print(c('1', s.get('title') or s.get('first_prompt') or '(empty session)'))
+    print()
+    src = {'custom': 'renamed by you', 'ai': 'automatic title'}.get(s.get('title_src'), 'first prompt')
+    status = (c('32', '● open now') + f"  (pid {live['pid']}, {live.get('kind', '')}, {live.get('status', '')})") if live else 'closed'
+    all_sessions = build_index()
+    rec = lineages(all_sessions, live_sessions()).get(sid) or {'head': sid, 'members': [s], 'last': s['mtime'], 'workers': set(), 'original': sid}
+    for k, v in (('ID', sid),
+                 ('Project', s.get('cwd') or os.path.basename(s.get('project_dir', ''))),
+                 ('Branch', s.get('branch') or '-'),
+                 ('Type', 'background job' if s.get('kind') == 'bg' else 'interactive'),
+                 ('Model', s.get('model') or '-'),
+                 ('Claude', s.get('version') or '-'),
+                 ('Prompts', str(s.get('n_prompts') or 0)),
+                 ('Created', fmt_iso(s.get('first_ts'))),
+                 ('Last activity', fmt_full(s['mtime'])),
+                 ('Size', human(s['size'])),
+                 ('Title', src),
+                 ('Pinned', 'yes' if sid in pins else 'no'),
+                 ('Status', status)):
+        print(f"{c('2', k.ljust(14))} {v}")
+    if len(rec['members']) > 1:
+        print()
+        print(c('1', f"── Same conversation: {len(rec['members'])} transcripts ──"))
+        for m in rec['members']:
+            role = 'daemon worker copy' if m['id'] in rec['workers'] else ('original' if m['id'] == rec['original'] else 'fork')
+            if m['id'] == rec['head']:
+                role += ', listed'
+            running = c('32', ' ● running now') if m['id'] in live_sessions() else ''
+            mark = '▸' if m['id'] == sid else ' '
+            print(f"{mark} {fmt_full(m['mtime'])}  {str(m.get('n_prompts') or 0).rjust(3)} prompts  {m['id'][:8]}  {c('2', role)}{running}")
+        print(c('2', 'Forks copy the history up to the branch point. Worker copies are what the daemon runs for'))
+        print(c('2', 'you: while one is running it holds the latest messages, the original catches up when it'))
+        print(c('2', 'retires, so the running one is listed. ctrl-v shows all of them.'))
+    f, mm = open_mm(s['path'])
+    if mm:
+        try:
+            prompts = s.get('prompts') or []
+            print()
+            print(c('1', '── First prompts ──'))
+            for pr in prompts[:3]:
+                print(c('33', '▸ ') + squash(pr, 240))
+            if (s.get('n_prompts') or 0) > 3 and s.get('last_prompt'):
+                print()
+                print(c('1', f"── Last prompt ({s['n_prompts']} in total) ──"))
+                print(c('33', '▸ ') + s['last_prompt'])
+            print()
+            print(c('1', '── Last reply ──'))
+            for d in last_entries(mm, b'"type":"assistant"', 60):
+                if d.get('type') != 'assistant':
+                    continue
+                txt = text_of((d.get('message') or {}).get('content')).strip()
+                if txt:
+                    print(squash(txt, 1000))
+                    break
+        finally:
+            mm.close()
+            f.close()
+    print()
+    if live and live.get('kind') == 'bg':
+        print(c('2', f"claude attach {sid[:8]}   (running in the background: Enter attaches, no copy)"))
+    else:
+        print(c('2', f"claude --resume {sid}"))
+
+
+# ---------- actions ----------
+
+def pause():
+    try:
+        input(c('2', 'Press Enter to go back to the list…'))
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def confirm(question):
+    try:
+        return input(question + ' [y/N] ').strip().lower() in ('y', 'yes')
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def cmd_rename(sid, new=None):
+    s = find(sid)
+    if not s:
+        print('ccs: session not found')
+        pause()
+        return
+    sid = s['id']
+    print(c('1', 'Rename session'))
+    print(f"Current: {s.get('title') or s.get('first_prompt') or '(empty)'}")
+    print(f"Project: {s.get('cwd') or ''}")
+    live = live_sessions()
+    if sid in live or lineage_live(lineages(build_index(), live)[sid], live):
+        print(c('33', '⚠ This conversation is open in another terminal: rename it there with /rename,'))
+        print(c('33', '  otherwise that process would write the old name back on its next save.'))
+        pause()
+        return
+    if new is None:
+        prefill = s.get('title') or ''
+        try:
+            try:
+                import readline
+                readline.set_startup_hook(lambda: readline.insert_text(prefill))
+            except Exception:
+                readline = None
+            try:
+                new = input('New name (empty = cancel): ')
+            finally:
+                if readline:
+                    readline.set_startup_hook()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+    new = ' '.join(new.split())
+    if not new:
+        return
+    path = s['path']
+    st = os.stat(path)
+    # same compact format Claude Code writes (its tail scanner uses a regex without spaces)
+    entry = json.dumps({'type': 'custom-title', 'customTitle': new, 'sessionId': sid},
+                       ensure_ascii=False, separators=(',', ':'))
+    payload = entry.encode('utf-8') + b'\n'
+    if st.st_size > 0:
+        with open(path, 'rb') as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b'\n':
+                payload = b'\n' + payload
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)   # one append, safe against a concurrent writer
+    with os.fdopen(fd, 'ab') as f:                     # fdopen writes the whole payload (no short write)
+        f.write(payload)
+    quiet_file = os.stat(path).st_size == st.st_size + len(payload)
+    if quiet_file:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # keep the date ordering unchanged
+    side = os.path.join(os.path.dirname(path), sid)
+    os.makedirs(side, exist_ok=True)
+    write_json_atomic(os.path.join(side, 'custom-title.json'), {'customTitle': new})
+    cache = read_json(CACHE, {})
+    if isinstance(cache, dict) and path in cache:
+        if quiet_file and cache[path].get('size') == st.st_size and cache[path].get('mtime') == st.st_mtime:
+            st2 = os.stat(path)
+            cache[path].update(title=squash(new, 150), title_src='custom', mtime=st2.st_mtime, size=st2.st_size)
+        else:
+            del cache[path]               # the entry was stale or someone else appended too: rescan it next time
+        write_json_atomic(CACHE, cache)
+    print(c('32', f"✓ renamed: {squash(new, 150)}"))
+
+
+def cmd_pin(sids):
+    pins = load_pins()
+    sessions = build_index()
+    for sid in sids:
+        s = find(sid, sessions)
+        if not s:
+            continue
+        if s['id'] in pins:
+            pins.remove(s['id'])
+        else:
+            pins.insert(0, s['id'])
+    save_pins(pins)
+
+
+def cmd_delete(sids):
+    sessions = build_index()
+    live = live_sessions()
+    targets = []
+    for sid in sids:
+        s = find(sid, sessions)
+        if s:
+            targets.append(s)
+    if not targets:
+        print('ccs: no session found')
+        pause()
+        return
+    print(c('1', f"Move {len(targets)} session(s) to the trash?"))
+    lin0 = lineages(sessions, live)
+    for s in targets:
+        flag = c('31', '  (open now, will be skipped)') if lineage_live(lin0[s['id']], live) else ''
+        print(f"  • {s.get('title') or s.get('first_prompt') or '(empty)'}  {c('2', s['id'][:8])}{flag}")
+    print(c('2', f"Trash: {TRASH}   (restore with: ccs restore <id>)"))
+    if not confirm('Confirm'):
+        return
+    pins = load_pins()
+    live = live_sessions()                 # re-checked after the confirmation, on a fresh index
+    lin = lineages(build_index(), live)
+    moved = 0
+    for s in targets:
+        rec = lin.get(s['id'])
+        if s['id'] in live or (rec and lineage_live(rec, live)) or not os.path.exists(s['path']):
+            continue
+        trash_session(s, pins)
+        moved += 1
+    save_pins(pins)
+    print(c('32', f"✓ {moved} session(s) moved to the trash"))
+    if moved != len(targets):
+        pause()
+
+
+def trash_session(s, pins):
+    """Move one transcript (+ its sidecar directory) into the trash, keeping the project layout."""
+    proj = os.path.basename(s['project_dir'])
+    dest_dir = os.path.join(TRASH, proj)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(s['path']))
+    dest_side = os.path.join(dest_dir, s['id'])
+    if os.path.lexists(dest) or os.path.lexists(dest_side):
+        # an earlier deletion of the same id: set it aside under a unique suffix, never overwrite
+        stamp, n = time.strftime('%Y%m%d-%H%M%S'), 0
+        while os.path.lexists(f"{dest}.{stamp}") or os.path.lexists(f"{dest_side}.{stamp}"):
+            n += 1
+            stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{n}"
+        if os.path.lexists(dest_side):
+            os.rename(dest_side, f"{dest_side}.{stamp}")
+        if os.path.lexists(dest):
+            os.rename(dest, f"{dest}.{stamp}")
+    shutil.move(s['path'], dest)
+    side = os.path.join(s['project_dir'], s['id'])
+    if os.path.isdir(side):
+        shutil.move(side, dest_side)
+    if s['id'] in pins:
+        pins.remove(s['id'])
+
+
+def int_arg(args, flag, default):
+    if flag not in args:
+        return default
+    i = args.index(flag)
+    v = args[i + 1] if i + 1 < len(args) else ''
+    if not v.isdigit():
+        sys.exit(f"ccs: {flag} needs a whole number (got {v!r})")
+    return int(v)
+
+
+def cmd_prune(args):
+    yes = '--yes' in args
+    days = int_arg(args, '--days', 30)
+    max_prompts = int_arg(args, '--max', 2)
+    sessions = build_index()
+    pins = load_pins()
+    live = live_sessions()
+    cutoff = time.time() - days * 86400
+    lin = lineages(sessions, live)
+    cands = [s for s in sessions
+             if s['id'] not in pins and not lineage_live(lin[s['id']], live) and s['mtime'] < cutoff
+             and not s.get('unreadable') and (s.get('n_prompts') or 0) <= max_prompts]
+    cands.sort(key=lambda s: s['mtime'])
+    if not cands:
+        print(f"nothing to prune: no unpinned session older than {days} days with ≤ {max_prompts} prompts")
+        if not yes:
+            pause()
+        return
+    size = sum(s['size'] for s in cands)
+    print(c('1', f"{len(cands)} session(s) older than {days} days with at most {max_prompts} prompt(s) · {human(size)}"))
+    print(c('2', f"(ccs prune --days N --max N changes the thresholds; pinned and open sessions are never touched)"))
+    print()
+    for s in cands:
+        print(f"  {fmt_full(s['mtime'])}  {str(s.get('n_prompts') or 0).rjust(2)} prompt  "
+              f"{fit(project_label(s), 18)}  {squash(s.get('title') or s.get('first_prompt') or '(empty)', 60)}")
+    print()
+    print(c('2', f"Trash: {TRASH}   (restore with: ccs restore <id>)"))
+    if not yes and not confirm('Move them all to the trash?'):
+        return
+    live = live_sessions()                 # re-checked right before touching anything, on a fresh index
+    fresh = build_index()
+    lin = lineages(fresh, live)
+    by_id = {x['id']: x for x in fresh}
+    moved = 0
+    for s in cands:
+        now = by_id.get(s['id'])
+        if (now is None or lineage_live(lin[now['id']], live) or now.get('unreadable')
+                or now['mtime'] >= cutoff or (now.get('n_prompts') or 0) > max_prompts):
+            continue                       # gone, opened, or grown since the list was shown
+        trash_session(now, pins)
+        moved += 1
+    save_pins(pins)
+    print(c('32', f"✓ {moved} session(s) moved to the trash"))
+
+
+def message_uuids(path):
+    """uuids of the real messages: assistant entries and user prompts (local-command noise is ignored).
+    None when the file cannot be read: callers must not treat that as 'no messages'."""
+    out = set()
+    f, mm = open_mm(path)
+    if mm is None:
+        try:
+            return out if os.path.getsize(path) == 0 else None
+        except OSError:
+            return None
+    try:
+        pos, L = 0, len(mm)
+        while pos < L:
+            e = mm.find(b'\n', pos)
+            if e < 0:
+                e = L
+            line = mm[pos:e]
+            pos = e + 1
+            if b'"uuid":"' not in line:
+                continue
+            if b'"type":"assistant"' in line:
+                d = parse(line)
+                if d and d.get('type') == 'assistant' and d.get('uuid'):
+                    out.add(d['uuid'])
+            elif b'"type":"user"' in line:
+                d = parse(line)
+                if d and d.get('type') == 'user' and d.get('uuid'):
+                    txt = text_of((d.get('message') or {}).get('content'))
+                    if is_prompt(d, txt) or b'"tool_result"' in line:
+                        out.add(d['uuid'])
+    finally:
+        mm.close()
+        f.close()
+    return out
+
+
+def lineage_live(rec, live):
+    return any(m['id'] in live for m in rec['members'])
+
+
+def cmd_dedupe(args):
+    """Trash the copies of a conversation that hold no message of their own.
+    A copy is a fork or a daemon worker transcript whose user prompts and assistant messages
+    all exist in transcripts that stay on disk. --forks N also trashes forks with at most
+    N messages of their own (they are listed first, so you can judge)."""
+    yes = '--yes' in args
+    max_own = int_arg(args, '--forks', 0)
+    sessions = build_index()
+    live = live_sessions()
+    pins = load_pins()
+    lin = lineages(sessions, live)
+    safe, kept = [], []      # (member, lineage, own_count, reason)
+    seen = set()
+    for s in sessions:
+        rec = lin[s['id']]
+        if id(rec) in seen or len(rec['members']) < 2:
+            continue
+        seen.add(id(rec))
+        uu = {m['id']: message_uuids(m['path']) for m in rec['members']}
+        retained = [m for m in rec['members'] if m['id'] == rec['head']]
+        candidates = []
+        for m in rec['members']:
+            if m['id'] == rec['head']:
+                continue
+            why = ('conversation open now' if lineage_live(rec, live) else
+                   'pinned' if m['id'] in pins else
+                   'could not be read' if m.get('unreadable') or uu[m['id']] is None else None)
+            if why:
+                retained.append(m)
+                kept.append((m, rec, None, why))
+            else:
+                candidates.append(m)
+        # newest first; what a copy holds must exist in the transcripts that stay, not in other copies
+        for m in sorted(candidates, key=lambda m: -m['mtime']):
+            staying = set().union(*(uu[r['id']] or set() for r in retained)) if retained else set()
+            own = len(uu[m['id']] - staying)
+            if own > max_own:
+                retained.append(m)
+                kept.append((m, rec, own, f'{own} own message(s)'))
+            else:
+                safe.append((m, rec, own, list(retained)))   # the transcripts this decision relies on
+    kept.sort(key=lambda t: (t[2] is None, t[2] or 0))
+    if kept:
+        print(c('1', f"kept ({len(kept)}):"))
+        for m, rec, own, why in kept:
+            kind = 'worker' if m['id'] in rec['workers'] else 'fork'
+            print(f"  {fmt_full(m['mtime'])}  {m['id'][:8]}  {kind:6}  {squash(title_of(m), 48):48}  {c('33', why)}")
+        print(c('2', "  (ccs dedupe --forks N also trashes forks with at most N own messages; x in the list trashes one)"))
+        print()
+    if not safe:
+        print('nothing to dedupe: every other copy has messages of its own')
+        if not yes:
+            pause()
+        return
+    size = sum(m['size'] for m, _, _, _ in safe)
+    print(c('1', f"{len(safe)} cop{'y' if len(safe) == 1 else 'ies'} with no message of their own · {human(size)}"))
+    for m, rec, own, _deps in safe:
+        kind = 'worker' if m['id'] in rec['workers'] else 'fork'
+        extra = f"  ({own} own)" if own else ''
+        print(f"  {fmt_full(m['mtime'])}  {m['id'][:8]}  {kind:6}  → kept {rec['head'][:8]}  {squash(title_of(m), 48)}{extra}")
+    print(c('2', f"Trash: {TRASH}   (restore with: ccs restore <id>)"))
+    if not yes and not confirm('Move them to the trash?'):
+        return
+    live = live_sessions()                 # re-checked right before touching anything, on a fresh index
+    lin = lineages(build_index(), live)
+    moved = skipped = 0
+    for m, rec, _, deps in safe:
+        now = lin.get(m['id'])
+        try:
+            cur = os.stat(m['path'])
+            unchanged = cur.st_size == m['size'] and cur.st_mtime == m['mtime']
+            deps_ok = all(os.stat(d['path']).st_size >= d['size'] for d in deps)   # retained ones still there, not truncated
+        except OSError:
+            unchanged = deps_ok = False
+        if now is None or lineage_live(now, live) or not unchanged or not deps_ok:
+            skipped += 1
+            continue
+        trash_session(m, pins)
+        moved += 1
+    save_pins(pins)
+    print(c('32', f"✓ {moved} moved to the trash") + (c('33', f"  ({skipped} skipped: changed or opened meanwhile)") if skipped else ''))
+
+
+def title_of(s):
+    return s.get('title') or s.get('first_prompt') or '(empty)'
+
+
+def cmd_text(args):
+    st = load_state()
+    if '--ask' in args:
+        try:
+            cur = st.get('text', '')
+            print(c('2', 'Full-text filter: sessions whose prompts contain all the words (empty = clear).'))
+            new = input(f"Words [{cur}]: " if cur else 'Words: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        st['text'] = new
+    else:
+        st['text'] = ' '.join(args).strip()
+    save_state(st)
+
+
+def cmd_grep(args):
+    words = ' '.join(args).casefold().split()
+    if not words:
+        sys.exit('ccs: usage: ccs grep <words>')
+    sessions = build_index()
+    hits = sorted((s for s in sessions if matches_text(s, words)), key=lambda s: -s['mtime'])
+    for s in hits:
+        print(f"{s['id']}  {fmt_full(s['mtime'])}  {fit(project_label(s), 18)}  "
+              f"{squash(s.get('title') or s.get('first_prompt') or '(empty)', 60)}")
+        hit = text_hit(s, words)
+        if hit:
+            print(c('2', '    ▸ ' + squash(hit, 160)))
+    print(c('2', f"{len(hits)} session(s) match"), file=sys.stderr)
+
+
+def trash_items():
+    items = []
+    if not os.path.isdir(TRASH):
+        return items
+    for proj in os.scandir(TRASH):
+        if not proj.is_dir():
+            continue
+        for f in os.scandir(proj.path):
+            m = NAME_RE.match(f.name)
+            if m and f.is_file():
+                items.append(dict(id=m.group(1), path=f.path, proj=proj.name, mtime=f.stat().st_mtime,
+                                  deleted=os.stat(f.path).st_ctime))
+    items.sort(key=lambda i: -i['deleted'])
+    return items
+
+
+def trash_aside_count():
+    try:
+        return sum(1 for d in os.scandir(TRASH) if d.is_dir()
+                   for f in os.listdir(d.path) if re.search(r'\.jsonl\.\d{8}-\d{6}(-\d+)?$', f))
+    except FileNotFoundError:
+        return 0
+
+
+def cmd_trash():
+    items = trash_items()
+    if not items:
+        aside = trash_aside_count()
+        print('trash is empty' + (f" (apart from {aside} set-aside backup(s) *.jsonl.<date> in {TRASH}, restore those by hand)" if aside else ''))
+        return
+    for i in items:
+        info = scan_file(i['path'], i['id'])
+        print(f"{i['id']}  {fmt_full(i['mtime'])}  {i['proj'].lstrip('-')[-24:]:24}  "
+              f"{info.get('title') or info.get('first_prompt') or '(empty)'}")
+    print()
+    aside = trash_aside_count()
+    extra = f" · {aside} older deletion(s) of the same ids kept aside as *.jsonl.<date> (restore those by hand)" if aside else ''
+    print(c('2', f"{len(items)} session(s) · restore with: ccs restore <id> · delete for good with: rm -rf {TRASH}{extra}"))
+
+
+def cmd_restore(sid):
+    hits = [i for i in trash_items() if i['id'] == sid or i['id'].startswith(sid)]
+    if len(hits) != 1:
+        sys.exit('ccs: session not found in the trash (or ambiguous prefix)')
+    i = hits[0]
+    proj_dir = os.path.join(PROJECTS, i['proj'])
+    dest = os.path.join(proj_dir, os.path.basename(i['path']))
+    side = os.path.join(TRASH, i['proj'], i['id'])
+    dest_side = os.path.join(proj_dir, i['id'])
+    if os.path.exists(dest) or (os.path.isdir(side) and os.path.exists(dest_side)):
+        sys.exit(f"ccs: {i['id']} already exists in {proj_dir} — refusing to overwrite it")
+    os.makedirs(proj_dir, exist_ok=True)
+    shutil.move(i['path'], dest)
+    if os.path.isdir(side):
+        try:
+            shutil.move(side, dest_side)
+        except OSError as e:
+            shutil.move(dest, i['path'])
+            sys.exit(f"ccs: restore failed on the sidecar directory ({e}); nothing was changed")
+    print(c('32', f"✓ restored {i['id']} into {proj_dir}"))
+
+
+def cmd_export(sid, out=None, quiet=False, force=False):
+    s = find(sid)
+    if not s:
+        print('ccs: session not found')
+        pause()
+        return
+    title = s.get('title') or s.get('first_prompt') or s['id']
+    if not out:
+        slug = re.sub(r'[^A-Za-z0-9]+', '-', title).strip('-')[:60] or 'session'
+        out = os.path.join(os.path.expanduser('~/Downloads'), f"claude-{slug}-{s['id'][:8]}.md")
+    out = os.path.abspath(os.path.expanduser(out))
+    if out.endswith('.jsonl') or os.path.realpath(out).startswith(os.path.realpath(CLAUDE_DIR) + os.sep):
+        sys.exit("ccs: refusing to write the export inside Claude's own directory or over a transcript")
+    if os.path.exists(out) and not force:
+        sys.exit(f"ccs: {out} exists (add --force to overwrite)")
+    f, mm = open_mm(s['path'])
+    lines = [f"# {title}", '', f"- Session: `{s['id']}`", f"- Project: `{s.get('cwd') or ''}`",
+             f"- Branch: {s.get('branch') or '-'}", f"- Last activity: {fmt_full(s['mtime'])}",
+             f"- Exported: {dt.datetime.now():%d %b %Y %H:%M} with ccs", '', '---', '']
+    turns = 0
+    if mm:
+        try:
+            for line in head_lines(mm, 1 << 40):
+                if b'"type":"user"' not in line and b'"type":"assistant"' not in line:
+                    continue
+                d = parse(line)
+                if not d or d.get('isSidechain'):
+                    continue
+                t = d.get('type')
+                msg = d.get('message') or {}
+                content = msg.get('content')
+                if t == 'user':
+                    txt = text_of(content)
+                    if not is_prompt(d, txt):
+                        continue
+                    lines += ['## You', '', txt.strip(), '']
+                    turns += 1
+                elif t == 'assistant':
+                    parts = []
+                    if isinstance(content, list):
+                        for b in content:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get('type') == 'text' and (b.get('text') or '').strip():
+                                parts.append(b['text'].strip())
+                            elif b.get('type') == 'tool_use':
+                                parts.append(f"> 🔧 `{b.get('name', 'tool')}`")
+                    elif isinstance(content, str) and content.strip():
+                        parts.append(content.strip())
+                    if parts:
+                        lines += ['## Claude', '', '\n\n'.join(parts), '']
+        finally:
+            mm.close()
+            f.close()
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, 'w', encoding='utf-8') as fo:
+        fo.write('\n'.join(lines))
+    print(c('32', f"✓ exported {turns} prompt(s) to {out}"))
+    if not quiet:
+        pause()
+
+
+def cmd_open(sid):
+    s = find(sid)
+    cwd = s.get('cwd') if s else None
+    if cwd and os.path.isdir(cwd):
+        for opener in ('open', 'xdg-open'):
+            try:
+                if subprocess.run([opener, cwd], check=False).returncode == 0:
+                    return
+            except FileNotFoundError:
+                continue
+        print(cwd)
+
+
+def cmd_copy(sid):
+    s = find(sid)
+    if not s:
+        return
+    import shlex
+    cwd = s.get('cwd') or ''
+    text = f"cd {shlex.quote(cwd)} && claude --resume {s['id']}" if cwd else f"claude --resume {s['id']}"
+    for clip in (['pbcopy'], ['wl-copy'], ['xclip', '-selection', 'clipboard']):
+        try:
+            if subprocess.run(clip, input=text.encode(), check=False).returncode == 0:
+                return
+        except FileNotFoundError:
+            continue
+    print(text)
+
+
+def cmd_cycle(what):
+    st = load_state()
+    if what == 'sort':
+        st['sort'] = SORTS[(SORTS.index(st['sort']) + 1) % len(SORTS)]
+    elif what == 'filter':
+        st['filter'] = FILTERS[(FILTERS.index(st['filter']) + 1) % len(FILTERS)]
+    elif what == 'all':
+        st['show_all'] = not st['show_all']
+    elif what == 'forks':
+        st['show_forks'] = not st['show_forks']
+    save_state(st)
+
+
+def cmd_reset(show_all):
+    st = load_state()
+    st['filter'] = 'all'
+    st['text'] = ''
+    st['show_forks'] = False
+    st['show_all'] = bool(show_all)
+    save_state(st)
+
+
+def main(argv):
+    cmd = argv[0] if argv else 'list'
+    args = argv[1:]
+    ensure_private()
+    migrate_trash()
+    if cmd == 'list':
+        cmd_list()
+    elif cmd == 'header':
+        cmd_header()
+    elif cmd == 'keys':
+        cmd_keys()
+    elif cmd == 'stats':
+        cmd_stats()
+    elif cmd == 'preview':
+        cmd_preview(args[0])
+    elif cmd == 'rename':
+        cmd_rename(args[0], ' '.join(args[1:]) if len(args) > 1 else None)
+    elif cmd == 'pin':
+        cmd_pin(args)
+    elif cmd == 'delete':
+        cmd_delete(args)
+    elif cmd == 'trash':
+        cmd_trash()
+    elif cmd == 'restore':
+        cmd_restore(args[0])
+    elif cmd == 'export':
+        files = [a for a in args[1:] if not a.startswith('--')]
+        cmd_export(args[0], files[0] if files else None, quiet='--quiet' in args, force='--force' in args)
+    elif cmd == 'open':
+        cmd_open(args[0])
+    elif cmd == 'copy':
+        cmd_copy(args[0])
+    elif cmd == 'cycle':
+        cmd_cycle(args[0])
+    elif cmd == 'text':
+        cmd_text(args)
+    elif cmd == 'grep':
+        cmd_grep(args)
+    elif cmd == 'prune':
+        cmd_prune(args)
+    elif cmd == 'dedupe':
+        cmd_dedupe(args)
+    elif cmd == 'json-get':          # reads JSON on stdin, prints the value at a dotted path (used for herdr)
+        d = json.load(sys.stdin)
+        for k in args[0].split('.'):
+            d = d.get(k) if isinstance(d, dict) else None
+        print(d if d is not None else '')
+    elif cmd == 'reset':
+        cmd_reset('--all' in args)
+    elif cmd == 'reindex':
+        try:
+            os.remove(CACHE)
+        except FileNotFoundError:
+            pass
+        print(f"index rebuilt: {len(build_index())} sessions")
+    elif cmd == 'resolve':          # prints "id<TAB>cwd<TAB>title" for an id or a unique prefix
+        s = find(args[0])
+        if not s:
+            sys.exit(1)
+        print(f"{s['id']}\t{s.get('cwd') or ''}\t{squash(s.get('title') or s.get('first_prompt') or '', 60)}")
+    elif cmd == 'is-live':          # exit 0 and print the kind (interactive|bg) when the session has a live process
+        rec = live_sessions().get(args[0])
+        if not rec:
+            sys.exit(1)
+        print(rec.get('kind') or '')
+    else:
+        sys.exit(f"ccs: unknown python command {cmd}")
+
+
+main(sys.argv[1:])
+PY
+
+py() { python3 -I -c "$PYCODE" "$@"; }
+
+usage() { awk 'NR > 1 && /^set -euo pipefail/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$SELF"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { echo "ccs: '$1' is required ($2)" >&2; exit 1; }
+}
+
+need_fzf() {
+  need fzf "brew install fzf"
+  local v
+  v=$(fzf --version 2>/dev/null | sed 's/[^0-9.].*//')
+  if [[ $(printf '%s\n%s\n' 0.58 "$v" | sort -t. -k1,1n -k2,2n | head -1) != 0.58 ]]; then
+    echo "ccs: fzf $v is too old, 0.58 or newer is needed (brew upgrade fzf)" >&2
+    exit 1
+  fi
+}
+
+# Split one "id<TAB>cwd<TAB>rest" line into $id $cwd $rest. `read` with IFS=tab would
+# collapse an empty cwd field, so the fields are cut by hand.
+split_line() {
+  local line="$1" tail
+  id="${line%%$'\t'*}"
+  tail="${line#*$'\t'}"
+  [[ $line == *$'\t'* ]] || tail=""
+  cwd="${tail%%$'\t'*}"
+  rest="${tail#*$'\t'}"
+  [[ $tail == *$'\t'* ]] || rest=""
+}
+
+resume_session() {
+  local id="$1" cwd="$2" fork="${3:-}"
+  local bin="${CCS_CLAUDE_BIN:-claude}"
+  command -v "$bin" >/dev/null 2>&1 || bin="$HOME/.local/bin/claude"
+  local kind=""
+  if [[ -z $fork ]] && kind=$(py is-live "$id"); then
+    if [[ $kind == bg ]]; then
+      # A daemon worker is running this conversation: attach to it. `--resume` would start a copy.
+      echo "→ $bin attach ${id:0:8}  (running in the background: attaching, no copy made)"
+      exec "$bin" attach "${id:0:8}"
+    fi
+    local a
+    read -r -p "⚠  This session is open in another Claude Code process; resuming here starts a COPY of it. Continue? [y/N] " a
+    [[ $a == [yY] ]] || exit 0
+  fi
+  if [[ -n $cwd && -d $cwd ]]; then
+    cd "$cwd"
+  else
+    echo "ccs: the project directory no longer exists (${cwd:-?}), starting from \$HOME" >&2
+    cd "$HOME"
+  fi
+  local extra=() env_args=()
+  [[ -n $fork ]] && extra=(--fork-session)
+  if [[ -n ${CCS_CLAUDE_ARGS:-} ]]; then
+    set -f; read -r -d '' -a env_args <<<"$CCS_CLAUDE_ARGS" || true; set +f   # whitespace-separated flags (no quoting), no globbing
+  fi
+  echo "→ $bin --resume $id ${extra[*]:-}  (in $PWD)"
+  exec "$bin" --resume "$id" ${extra[@]+"${extra[@]}"} ${env_args[@]+"${env_args[@]}"} ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+}
+
+# Single-quote a string for a POSIX/zsh/bash command line.
+shq() { local q=${1//\'/\'\\\'\'}; printf "'%s'" "$q"; }
+
+# Open the session in a new herdr pane (split to the right of this one) or tab; ccs stays open.
+herdr_open() {
+  local id="$1" cwd="$2" title="$3" how="${4:-split}" out pane ws=()
+  if [[ -z ${HERDR_ENV:-} ]] || ! command -v herdr >/dev/null 2>&1; then
+    echo "ccs: not running inside herdr — use Enter to resume here" >&2
+    sleep 1.5
+    return 1
+  fi
+  [[ -n $cwd && -d $cwd ]] || cwd="$HOME"
+  local label="${title:-$id}"
+  label="${label:0:40}"
+  if [[ $how == tab ]]; then
+    [[ -n ${HERDR_WORKSPACE_ID:-} ]] && ws=(--workspace "$HERDR_WORKSPACE_ID")
+    out=$(herdr tab create ${ws[@]+"${ws[@]}"} --cwd "$cwd" --label "$label" --focus) || return 1
+    pane=$(printf '%s' "$out" | py json-get result.root_pane.pane_id)
+  else
+    out=$(herdr pane split ${HERDR_PANE_ID:+--pane "$HERDR_PANE_ID"} --direction right --cwd "$cwd" --focus) || return 1
+    pane=$(printf '%s' "$out" | py json-get result.pane.pane_id)
+  fi
+  if [[ -z $pane ]]; then
+    echo "ccs: herdr did not return a pane id: $out" >&2
+    sleep 2
+    return 1
+  fi
+  # `pane run` submits command text to the pane's shell: quote everything and go through
+  # `ccs resume`, so the pane gets the same attach / copy-warning / argument handling.
+  local cmd a
+  cmd="$(shq "$SELF") resume $(shq "$id")"
+  if ((${#CLAUDE_ARGS[@]})); then
+    cmd="$cmd --"
+    for a in "${CLAUDE_ARGS[@]}"; do cmd="$cmd $(shq "$a")"; done
+  fi
+  herdr pane run "$pane" "$cmd" >/dev/null
+}
+
+ui() {
+  local query="$1"
+  need_fzf
+  CCS_UI_ARGS=""                             # lets the h / t keys pass `ccs -- …` on to the new pane
+  if ((${#CLAUDE_ARGS[@]})); then CCS_UI_ARGS=$(printf '%s\037' "${CLAUDE_ARGS[@]}"); fi   # unit separator between args
+  export CCS_UI_ARGS
+  py reset ${SHOW_ALL:+--all}
+  [[ -n $GREP_TEXT ]] && py text "$GREP_TEXT"
+  # keys that only exist in navigation mode (search mode needs them for typing)
+  local nav='j,k,g,G,r,p,q,f,x,e,y,o,h,t,s,space,/,?'
+  local R="reload(\"\$CCS_SELF\" list)+transform-header(\"\$CCS_SELF\" header)"
+  local start=()
+  [[ -n $query ]] && start=(--bind "start:unbind($nav)+change-prompt(/ )")
+  local sel
+  export CCS_FORK_FLAG="$CACHE_DIR/fork-flag.$$"     # one flag per running ccs
+  rm -f "$CCS_FORK_FLAG"
+  local hdr rows rc
+  hdr=$(py header)   # builds/refreshes the index once, before the list starts
+  rows=$(py list)    # a python failure stops here with its message instead of an empty list
+  set +e
+  sel=$(printf '%s\n' "$rows" | SHELL=/bin/sh FZF_DEFAULT_OPTS= fzf --ansi --delimiter $'\t' --with-nth 3.. --no-sort --multi \
+      --height=100% --layout=reverse --info=inline-right --border=rounded --header-border=bottom \
+      --prompt '> ' --query "$query" --pointer '▶' --marker '✓' \
+      --header "$hdr" \
+      --preview "\"\$CCS_SELF\" preview {1}" --preview-window 'right,50%,wrap,border-left,<110(down,50%)' \
+      --bind 'j:down,k:up,g:first,G:last,q:abort,tab:toggle-preview,space:toggle+down' \
+      --bind "f:execute-silent(touch \"\$CCS_FORK_FLAG\")+accept" \
+      --bind "r:execute(\"\$CCS_SELF\" rename {1})+$R" \
+      --bind "p:execute-silent(\"\$CCS_SELF\" pin {+1})+$R" \
+      --bind "x:execute(\"\$CCS_SELF\" delete {+1})+$R" \
+      --bind "e:execute(\"\$CCS_SELF\" export {1})" \
+      --bind "y:execute-silent(\"\$CCS_SELF\" copy {1})" \
+      --bind "o:execute-silent(\"\$CCS_SELF\" open {1})" \
+      --bind "h:execute(\"\$CCS_SELF\" herdr {1})" \
+      --bind "t:execute(\"\$CCS_SELF\" herdr {1} --tab)" \
+      --bind "ctrl-f:execute(\"\$CCS_SELF\" text --ask)+$R" \
+      --bind "ctrl-x:execute(\"\$CCS_SELF\" prune)+$R" \
+      --bind "s:execute-silent(\"\$CCS_SELF\" cycle sort)+$R" \
+      --bind "ctrl-p:execute-silent(\"\$CCS_SELF\" cycle filter)+$R" \
+      --bind "ctrl-a:execute-silent(\"\$CCS_SELF\" cycle all)+$R" \
+      --bind "ctrl-v:execute-silent(\"\$CCS_SELF\" cycle forks)+$R" \
+      --bind "ctrl-r:execute-silent(\"\$CCS_SELF\" reindex)+$R" \
+      --bind "?:preview(\"\$CCS_SELF\" keys)" \
+      --bind "/:unbind($nav)+change-prompt(/ )" \
+      --bind "esc:transform:case \"\$FZF_PROMPT\" in '/ ') echo 'rebind($nav)+change-prompt(> )';; *) echo abort;; esac" \
+      ${start[@]+"${start[@]}"})
+  rc=$?
+  set -e
+  case $rc in
+    0) ;;
+    1|130) exit 0 ;;                      # nothing chosen / quit
+    *) echo "ccs: fzf failed (exit $rc)" >&2; exit "$rc" ;;
+  esac
+  local id cwd rest
+  split_line "$(printf '%s\n' "$sel" | head -n1)"
+  [[ -n $id ]] || exit 0
+  if [[ -e $CCS_FORK_FLAG ]]; then
+    rm -f "$CCS_FORK_FLAG"
+    resume_session "$id" "$cwd" fork
+  fi
+  rm -f "$CCS_FORK_FLAG"
+  resume_session "$id" "$cwd"
+}
+
+case "${1:-}" in -h|--help|help) usage; exit 0 ;; esac
+need python3 "brew install python"
+
+CLAUDE_ARGS=()
+QUERY=""
+SHOW_ALL=""
+GREP_TEXT=""
+while (($#)); do
+  case "$1" in
+    --) shift; CLAUDE_ARGS=("$@"); break ;;
+    -a|--all) SHOW_ALL=1; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    list|header|keys|stats|preview|rename|pin|delete|trash|restore|export|open|copy|cycle|reset|reindex|is-live|resolve|grep|prune|dedupe|text|json-get)
+      py "$@"; exit $? ;;
+    -g|--grep)
+      [[ -n ${2:-} ]] || { echo "ccs: usage: ccs -g <words>" >&2; exit 1; }
+      GREP_TEXT="$2"; shift 2 ;;
+    herdr)
+      [[ -n ${2:-} ]] || { echo "ccs: usage: ccs herdr <id> [--tab]" >&2; exit 1; }
+      line=$(py resolve "$2") || { echo "ccs: session '$2' not found (or ambiguous prefix)" >&2; exit 1; }
+      split_line "$line"
+      shift 2; how=split
+      while (($#)); do
+        case "$1" in
+          --tab) how=tab; shift ;;
+          --) shift; CLAUDE_ARGS=("$@"); break ;;
+          *) echo "ccs: unknown option for herdr: $1" >&2; exit 1 ;;
+        esac
+      done
+      if ((${#CLAUDE_ARGS[@]} == 0)) && [[ -n ${CCS_UI_ARGS:-} ]]; then
+        IFS=$'\037' read -r -d '' -a CLAUDE_ARGS < <(printf '%s' "$CCS_UI_ARGS") || true   # no here-string: it would add a newline
+      fi
+      herdr_open "$id" "$cwd" "$rest" "$how"; exit $? ;;
+    resume|fork)
+      mode="$1"
+      [[ -n ${2:-} ]] || { echo "ccs: usage: ccs $mode <id> [-- arg…]" >&2; exit 1; }
+      line=$(py resolve "$2") || { echo "ccs: session '$2' not found (or ambiguous prefix)" >&2; exit 1; }
+      shift 2
+      [[ ${1:-} == -- ]] && { shift; CLAUDE_ARGS=("$@"); }
+      split_line "$line"
+      [[ $mode == fork ]] && resume_session "$id" "$cwd" fork
+      resume_session "$id" "$cwd" ;;
+    -*) echo "ccs: unknown option $1" >&2; usage >&2; exit 1 ;;
+    *) QUERY="${QUERY:+$QUERY }$1"; shift ;;
+  esac
+done
+
+(umask 077; mkdir -p "$CACHE_DIR" "$CONF_DIR")
+ui "$QUERY"
